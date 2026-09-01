@@ -702,47 +702,156 @@ extended.
 | Hard links | Add a second directory entry pointing to the same inode, increment `links` |
 | Permissions | Use part of `reserved[]` for mode and owner bits |
 
-## 4.13 The classic mistakes (from the spec's own list)
+## 4.13 The 8 Classic Mistakes: Causes, Symptoms & Exact Answers
 
-1. Confusing bitmap index with absolute block number.
-2. Confusing inode number with table index.
-3. Allocating without setting the bitmap bit.
-4. Forgetting to fill `direct[]`.
-5. Forgetting the directory entry — the inode alone gives the file no name.
-6. Storing a bitmap index in `direct[]` instead of an absolute block number.
-7. Storing allocated size instead of actual size.
-8. Not zero-filling the final block.
-
-Be ready to say what each one would look like if it happened — the examiner may
-describe a symptom and ask which mistake caused it.
+Here are the 8 classic mistakes, the exact code flaw that causes each, what it looks like in `xxd` hex dumps, and the exact answer to give the examiner:
 
 ---
 
-# PART 5 — The Exercise That Predicts Your Grade
+### 1. Confusing bitmap index with absolute block number
+- **The Flaw:** Writing `bitmap_index` (e.g. `1`) into `inode.direct[0]` instead of absolute block number (`1 + 4 = 5`).
+- **Symptom on disk:** `inode.direct[0]` shows `01 00 00 00` instead of `05 00 00 00`. If data is written to block 1, it overwrites the **Inode Bitmap**, destroying filesystem metadata!
+- **Examiner Q:** *"Why is my Inode Bitmap corrupted after adding a file?"*
+- **Exact Answer:** *"The program passed a data bitmap index (1) directly to `fseek` instead of converting it to an absolute block number (`1 + 4 = 5`), overwriting Block 1 (Inode Bitmap)."*
 
-Get someone to hand you a hex dump of an image with two files in it, and answer
-from the bytes alone:
+---
 
-1. Is this a valid SimpleFS image? (check bytes 0–3)
-2. How many inodes are allocated? (byte at 4096, converted to binary)
-3. How many data blocks are in use? (byte at 8192)
-4. What are the file names? (ASCII at 16384 onward)
-5. Which inode does each name map to?
-6. How big is each file? (bytes 4–7 of its inode)
-7. Which blocks hold each file's data? (bytes 8–19 of its inode)
-8. What is the root directory's size, and does it match the number of entries?
+### 2. Confusing inode number with table index
+- **The Flaw:** Writing to `12288 + inode_number * 128` instead of `12288 + (inode_number - 1) * 128`, or passing `free_inode` to `set_bit` instead of `free_inode - 1`.
+- **Symptom on disk:** Inode 2 metadata gets written at offset `12544` (where Inode 3 belongs) instead of `12416`. Inode 1 (Root) or Inode 2 table slots stay empty or shift by 128 bytes.
+- **Examiner Q:** *"Why does `xxd -s 12416 -l 64` show all zeros after adding the first file?"*
+- **Exact Answer:** *"Off-by-one index error. Inode numbers are 1-indexed (1..32), but table offsets and bitmap indexes are 0-indexed. The code forgot to subtract 1 (`free_inode - 1`), writing the inode 128 bytes too far."*
 
-If you can do all eight without help, you are ready.
+---
 
-## The five answers to have word-perfect
+### 3. Allocating data blocks without setting the bitmap bit inside the loop
+- **The Flaw:** Calling `find_free_data_block()` multiple times in a loop, but setting `set_bit()` only after the loop finishes.
+- **Symptom on disk:** A 3-block file gets `direct = {5, 5, 5}`. Block 5 is overwritten 3 times, data from blocks 1 and 2 is lost, and blocks 6 and 7 are never allocated.
+- **Examiner Q:** *"Why does a 10 KB file have `direct[0] == direct[1] == direct[2] == 5`?"*
+- **Exact Answer:** *"First-fit searches for the first clear bit (`0`). Because the bit was not marked as allocated (`1`) immediately inside the loop, every iteration found the same clear bit and returned Block 5."*
 
-1. **`31 53 46 53`** — little-endian; the least significant byte of `0x53465331`
-   is stored first.
-2. **`links = 2`, `size = 128`** — `.` and `..` both name inode 1; two 64-byte
-   entries.
-3. **Bit 0 means block 4** — the bitmap tracks only the data region, which starts
-   at block 4.
-4. **Bit set inside the loop** — otherwise first-fit returns the same block
-   every time.
-5. **`size = 5000`, not 8192** — size is the real length; the rest of the second
-   block is zero padding.
+---
+
+### 4. Forgetting to fill `direct[]` array
+- **The Flaw:** Allocating data blocks and copying data to disk, but leaving `new_inode.direct[]` all `0`s (or unassigned).
+- **Symptom on disk:** Data exists at offset `20480` (Block 5), but the inode at `12416` shows `direct = {0, 0, 0}`. The file appears to have 0 data blocks.
+- **Examiner Q:** *"The data is on disk, but reading the file returns nothing or reads from Block 0. Why?"*
+- **Exact Answer:** *"The adder allocated the blocks and wrote the bytes, but failed to record the allocated block numbers into the `new_inode.direct[]` array before saving the inode to disk."*
+
+---
+
+### 5. Forgetting the directory entry
+- **The Flaw:** Initializing the inode and data blocks, but failing to write a `dirent_t` into Block 4.
+- **Symptom on disk:** `xxd -s 16384 -l 256` shows only `.` and `..`. The file's inode and data exist on disk as "orphans", but no program can find or open the file by name.
+- **Examiner Q:** *"The bitmaps show inode 2 and block 5 are allocated, but `ls` / lookup cannot find `test1.txt`. Why?"*
+- **Exact Answer:** *"An inode does not store a filename. Without creating a 64-byte `dirent_t` entry in Block 4 mapping the name `test1.txt` to Inode 2, the file is an orphan and unreachable."*
+
+---
+
+### 6. Storing a bitmap index in `direct[]` instead of absolute block number
+- **The Flaw:** `new_inode.direct[0] = index;` (e.g. `0`) instead of `index + 4` (`4` or `5`).
+- **Symptom on disk:** `direct[0]` reads `00 00 00 00` (which marks it unused) or `01 00 00 00` (which points to Block 1).
+- **Examiner Q:** *"Why does my file pointer point to the Inode Bitmap instead of user data?"*
+- **Exact Answer:** *"The bitmap index (1) was stored directly in `direct[]` without adding `DATA_REGION_BLOCK` (4). Absolute block numbers must always be $\text{index} + 4$."*
+
+---
+
+### 7. Storing allocated size instead of actual size
+- **The Flaw:** Setting `new_inode.size = required_blocks * 4096;` (e.g. `8192` for a 5000-byte file).
+- **Symptom on disk:** `inode.size` shows `0x00002000` (8192) instead of `0x00001388` (5000). Reading the file back returns 3192 trailing zero bytes of garbage padding.
+- **Examiner Q:** *"A 5000-byte file was added. Why is `inode.size` 8192?"*
+- **Exact Answer:** *"`inode.size` must store the exact byte size of the original source file (5000). The second block's extra 3192 bytes are internal fragmentation padding, not real file data."*
+
+---
+
+### 8. Not zero-filling the final block before copying
+- **The Flaw:** Using an uninitialized buffer or failing to `memset(buf, 0, 4096)` before `fread()`.
+- **Symptom on disk:** For a 5000-byte file, bytes 904 to 4095 of Block 6 contain leftover garbage memory from previous operations instead of clean `0x00` zeros.
+- **Examiner Q:** *"Why does the unused tail of the final data block contain stale text?"*
+- **Exact Answer:** *"The copy buffer was not cleared with `memset(&buf, 0, BLOCK_SIZE)` on each iteration. Stale bytes in memory got written to disk alongside the remaining 904 bytes."*
+
+---
+
+# PART 5 — Hex Dump Inspection Exercise (With Complete Answers)
+
+Suppose the examiner gives you raw `xxd` hex dumps of `disk.img` containing 2 user files (`test1.txt` [23 bytes] and `test2.txt` [5000 bytes]). Here is how you answer all 8 questions instantly:
+
+---
+
+### 1. Is this a valid SimpleFS image?
+- **How to check:** Look at bytes 0–3 of Block 0: `xxd -l 4 disk.img`
+- **Expected Dump:** `00000000: 3153 4653`
+- **Answer:** **Yes.** `0x31 0x53 0x46 0x53` in little-endian represents `0x53465331` (ASCII 'SFS1'), the valid SimpleFS magic number.
+
+---
+
+### 2. How many inodes are allocated?
+- **How to check:** Look at byte 0 of Block 1 (offset 4096): `xxd -s 4096 -l 1 disk.img`
+- **Expected Dump:** `00001000: 07`
+- **Calculation:** `0x07` in binary $= \text{0000 0111}_2 \implies$ Bits 0, 1, and 2 are set.
+- **Answer:** **3 inodes allocated** (Inode 1 = Root, Inode 2 = test1.txt, Inode 3 = test2.txt).
+
+---
+
+### 3. How many data blocks are in use?
+- **How to check:** Look at byte 0 of Block 2 (offset 8192): `xxd -s 8192 -l 1 disk.img`
+- **Expected Dump:** `00002000: 0f`
+- **Calculation:** `0x0F` in binary $= \text{0000 1111}_2 \implies$ Bits 0, 1, 2, 3 are set.
+- **Answer:** **4 data blocks in use** (Block 4 = Root Directory, Block 5 = test1.txt, Blocks 6 & 7 = test2.txt).
+
+---
+
+### 4. What are the filenames in the image?
+- **How to check:** Look at the ASCII column in Block 4 (offset 16384): `xxd -s 16384 -l 256 disk.img`
+- **Offsets:**
+  - `16384` (Slot 0): `.`
+  - `16448` (Slot 1): `..`
+  - `16512` (Slot 2): `test1.txt`
+  - `16576` (Slot 3): `test2.txt`
+- **Answer:** **The files are `.` (root), `..` (parent), `test1.txt`, and `test2.txt`.**
+
+---
+
+### 5. Which inode does each name map to?
+- **How to check:** Look at the first 4 bytes of each 64-byte directory entry:
+  - Offset `16384`: `01 00 00 00` $\implies$ Inode 1 (`.`)
+  - Offset `16448`: `01 00 00 00` $\implies$ Inode 1 (`..`)
+  - Offset `16512`: `02 00 00 00` $\implies$ Inode 2 (`test1.txt`)
+  - Offset `16576`: `03 00 00 00` $\implies$ Inode 3 (`test2.txt`)
+- **Answer:** `.` $\to$ Inode 1, `..` $\to$ Inode 1, `test1.txt` $\to$ Inode 2, `test2.txt` $\to$ Inode 3.
+
+---
+
+### 6. How big is each file?
+- **How to check:** Inspect bytes 4–7 of each inode in Inode Table (offset 12288):
+  - **Inode 1 (Root, offset 12288 + 4):** `00 01 00 00` $= 256$ bytes (4 entries $\times 64$).
+  - **Inode 2 (test1.txt, offset 12416 + 4):** `17 00 00 00` $= \text{0x17} = \mathbf{23\text{ bytes}}$.
+  - **Inode 3 (test2.txt, offset 12544 + 4):** `88 13 00 00` $= \text{0x1388} = \mathbf{5000\text{ bytes}}$.
+- **Answer:** `test1.txt` is **23 bytes**; `test2.txt` is **5000 bytes**; root directory is **256 bytes**.
+
+---
+
+### 7. Which blocks hold each file's data?
+- **How to check:** Inspect bytes 8–19 (`direct[0]`, `direct[1]`, `direct[2]`) of each inode:
+  - **Inode 2 (offset 12416 + 8):** `05 00 00 00  00 00 00 00  00 00 00 00` $\implies$ **Block 5**.
+  - **Inode 3 (offset 12544 + 8):** `06 00 00 00  07 00 00 00  00 00 00 00` $\implies$ **Blocks 6 and 7**.
+- **Answer:** `test1.txt` data is in **Block 5** (offset 20480); `test2.txt` data is in **Blocks 6 and 7** (offsets 24576 and 28672).
+
+---
+
+### 8. What is the root directory's size, and does it match the entries?
+- **How to check:** Inspect bytes 4–7 of Inode 1 at offset `12292`: `00 01 00 00` ($256$ bytes).
+- **Calculation:** There are 4 directory entries (`.`, `..`, `test1.txt`, `test2.txt`).  
+  $$4 \times 64\text{ bytes} = 256\text{ bytes}$$
+- **Answer:** **Yes, exactly matches.** Root directory size is $256$ bytes, corresponding to 4 active entries $\times 64$ bytes each.
+
+---
+
+## The 5 Word-Perfect Viva Answers to Memorize
+
+1. **`31 53 46 53`** — Little-endian format: the least significant byte `0x31` of `0x53465331` is stored at the lowest address.
+2. **`links = 2`, `size = 128`** — `.` and `..` both refer to Inode 1; two 64-byte directory entries exist at formatting.
+3. **Data Bit 0 means Block 4** — The data bitmap tracks only the data region, which begins at Block 4 (Blocks 0–3 are reserved metadata).
+4. **Bitmap bit set inside loop** — First-fit scans for the first free bit (`0`). Setting it immediately ensures subsequent allocations receive distinct blocks.
+5. **`size = 5000`, not 8192** — `inode.size` stores the actual file length; the trailing 3192 bytes in Block 7 are zero-filled padding.
+
